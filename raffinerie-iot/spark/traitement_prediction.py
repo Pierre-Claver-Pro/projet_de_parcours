@@ -1,79 +1,69 @@
-import sys
-sys.path.insert(0, '/tmp/pylibs')
-
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, to_timestamp
 from pyspark.sql.types import StructType, StringType, FloatType
 import joblib
 import pandas as pd
-import numpy as np
 
-# Charger le modèle
-loaded_model = joblib.load("/tmp/detector_v1.pkl")
+loaded_model = joblib.load('/app/models/detector_v1.pkl')
+print('Modele charge OK')
 
 schema = StructType() \
-    .add("machine_id", StringType()) \
-    .add("valeur", FloatType()) \
-    .add("timestamp", StringType()) \
-    .add("type_capteur", StringType())
+    .add('machine_id', StringType()) \
+    .add('valeur', FloatType()) \
+    .add('timestamp', StringType()) \
+    .add('type_capteur', StringType())
 
-spark = SparkSession.builder \
-    .appName("raffinerie-prediction") \
-    .getOrCreate()
+spark = SparkSession.builder.appName('raffinerie-prediction').getOrCreate()
+spark.sparkContext.setLogLevel('WARN')
 
-spark.sparkContext.setLogLevel("WARN")
-
-df = spark.readStream.format("kafka") \
-    .option("kafka.bootstrap.servers", "kafka:29092") \
-    .option("subscribe", "sensor-data") \
-    .option("startingOffsets", "latest") \
-    .option("failOnDataLoss", "false") \
+df = spark.readStream.format('kafka') \
+    .option('kafka.bootstrap.servers', 'kafka:29092') \
+    .option('subscribe', 'sensor-data') \
+    .option('startingOffsets', 'latest') \
+    .option('failOnDataLoss', 'false') \
     .load()
 
-json_df = df.selectExpr("CAST(value AS STRING)") \
-    .select(from_json(col("value"), schema).alias("data")) \
-    .select("data.*")
+json_df = df.selectExpr('CAST(value AS STRING)') \
+    .select(from_json(col('value'), schema).alias('data')) \
+    .select('data.*')
 
-json_df = json_df.withColumn("timestamp", to_timestamp("timestamp"))
-
-filtrees = json_df.filter(
-    ((col("type_capteur") == "temperature") & (col("valeur").between(30, 150))) |
-    ((col("type_capteur") == "vibration") & (col("valeur").between(0, 5)))
-)
+json_df = json_df.withColumn('timestamp', to_timestamp('timestamp'))
 
 def predict_and_route(batch_df, batch_id):
-    if batch_df.count() == 0:
+    count = batch_df.count()
+    if count == 0:
         return
-    from pyspark.sql.types import StringType as ST
-    batch_df2 = batch_df.withColumn("timestamp", batch_df["timestamp"].cast(ST()))
-    pandas_df = batch_df2.toPandas()
-    pandas_df['timestamp'] = pd.to_datetime(pandas_df['timestamp'])
-    pandas_df = pandas_df.sort_values('timestamp').reset_index(drop=True)
-    pandas_df['valeur_lag1'] = pandas_df['valeur'].shift(1)
-    pandas_df['valeur_lag2'] = pandas_df['valeur'].shift(2)
-    pandas_df['valeur_lag3'] = pandas_df['valeur'].shift(3)
-    pandas_df = pandas_df.dropna()
-    if pandas_df.empty:
+    pdf = batch_df.withColumn("timestamp", batch_df["timestamp"].cast("string")).toPandas()
+    pdf = pdf.dropna(subset=['valeur'])
+    if pdf.empty:
         return
-    X = pandas_df[['valeur', 'valeur_lag1', 'valeur_lag2', 'valeur_lag3']]
-    predictions = loaded_model.predict(X)
-    pandas_df['prediction_score'] = predictions.astype(float)
-    anomalies = pandas_df[predictions == -1][['timestamp', 'machine_id', 'type_capteur', 'valeur', 'prediction_score']]
+    pdf['timestamp'] = pd.to_datetime(pdf['timestamp'])
+    predictions = loaded_model.predict(pdf[['valeur']])
+    scores = loaded_model.decision_function(pdf[['valeur']])
+    pdf['prediction_score'] = scores
+    def get_severite(score):
+        if score < -0.15: return 'CRITIQUE'
+        elif score < -0.05: return 'WARNING'
+        else: return 'NORMAL'
+    pdf['severite'] = pdf['prediction_score'].apply(get_severite)
+    anomalies = pdf[predictions == -1][['timestamp','machine_id','type_capteur','valeur','prediction_score','severite']].copy()
+    anomalies['timestamp'] = anomalies['timestamp'].astype(str)
+    print(f'Batch {batch_id}: {count} lignes, {len(anomalies)} anomalies')
     if not anomalies.empty:
         spark.createDataFrame(anomalies).write \
-            .format("jdbc") \
-            .option("url", "jdbc:postgresql://timescaledb:5432/iotdb") \
-            .option("dbtable", "alertes_predictions") \
-            .option("user", "admin") \
-            .option("password", "admin") \
-            .option("driver", "org.postgresql.Driver") \
-            .mode("append") \
+            .format('jdbc') \
+            .option('url', 'jdbc:postgresql://timescaledb:5432/iotdb') \
+            .option('dbtable', 'alertes_predictions') \
+            .option('user', 'admin') \
+            .option('password', 'admin') \
+            .option('driver', 'org.postgresql.Driver') \
+            .mode('append') \
             .save()
-        print(f"Batch {batch_id} : {len(anomalies)} anomalie(s) détectée(s) ✅")
+        print(f'{len(anomalies)} anomalies ecrites!')
 
-query_predict = filtrees.writeStream \
+query_predict = json_df.writeStream \
     .foreachBatch(predict_and_route) \
-    .option("checkpointLocation", "/app/data/checkpoint_predict") \
+    .option('checkpointLocation', '/app/data/checkpoint_predict') \
     .start()
 
 query_predict.awaitTermination()

@@ -30,6 +30,9 @@ for obj in objects.get('Contents', []):
 
 # Garder uniquement les vraies données capteurs
 df = pd.DataFrame(records)
+print("Colonnes disponibles :", df.columns.tolist())
+print("Aperçu :")
+print(df.head(3))
 df = df[['machine_id', 'valeur', 'timestamp', 'type_capteur']].dropna()
 df['timestamp'] = pd.to_datetime(df['timestamp'])
 df['valeur'] = pd.to_numeric(df['valeur'], errors='coerce')
